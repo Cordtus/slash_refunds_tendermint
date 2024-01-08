@@ -1,11 +1,12 @@
 import argparse
 import json
-import requests
 import logging
 import shutil
-
 from subprocess import run
 from time import sleep
+
+import requests
+
 from utils.csv_utils import writeRefundsCsv
 
 BIN_DIR = ""  # if this isn't empty, make sure it ends with a slash
@@ -66,7 +67,15 @@ def getDelegationAmounts(
 
     while more_pages:
         endpoint_choice = (page % len(endpoints)) - 1
-        command = f"{BIN_DIR}{daemon} q staking delegations-to {valoper_address} --height {block_height} --page {page} --output json --limit {page_limit} --node {endpoints[endpoint_choice]} --chain-id {chain_id}"
+        command = (
+            f"{BIN_DIR}{daemon} q staking delegations-to {valoper_address} "
+            f"--height {block_height} "
+            f"--page {page} "
+            f"--output json "
+            f"--limit {page_limit} "
+            f"--node {endpoints[endpoint_choice]} "
+            f"--chain-id {chain_id}"
+        )
         logger.debug(f"Delegation amount command: {command}")
         logger.info(f"Page: {page}")
         result = run(
@@ -96,7 +105,12 @@ def getDelegationAmounts(
 
 
 def calculateRefundAmounts(
-    daemon: str, endpoint: str, chain_id: str, slash_block: int, valoper_address: str
+    daemon: str,
+    endpoint: str,
+    chain_id: str,
+    slash_block: int,
+    valoper_address: str,
+    min_refund: int,
 ):
     pre_slack_block = int(slash_block) - 5
     refund_amounts = {}
@@ -115,7 +129,7 @@ def calculateRefundAmounts(
         refund_amount = int(pre_slash_delegations[delegation_address]) - int(
             post_slash_delegations[delegation_address]
         )
-        if refund_amount > 100000000000000:
+        if refund_amount > int(min_refund):
             refund_amounts[delegation_address] = refund_amount
 
     logger.info(f"Number of refunds: {len(refund_amounts)}")
@@ -193,9 +207,9 @@ def issue_refunds(
     i = 0
     while i < batch_count:
         sign_cmd = (
-            f"{BIN_DIR}{daemon} tx sign /tmp/dist_{i}.json --from {keyname} -ojson "
+            f"{BIN_DIR}{daemon} tx sign /tmp/dist_{i}.json --from {keyname} -o json "
             f"--output-document /tmp/dist_{i}_signed.json --node {node} --chain-id {chain_id} "
-            f"--keyring-backend os"
+            f"--keyring-backend test"
         )
         broadcast_cmd = (
             f"{BIN_DIR}{daemon} tx broadcast /tmp/dist_{i}_signed.json --node {node} "
@@ -220,12 +234,15 @@ def issue_refunds(
                 text=True,
             )
             logger.info(f"Broadcasted refund: {result}")
-            shutil.move(f"/tmp/dist_{i}_signed.json", f"/tmp/dist_{i}_signed_refunded.json")
+            shutil.move(
+                f"/tmp/dist_{i}_signed.json", f"/tmp/dist_{i}_signed_refunded.json"
+            )
 
         i += 1
         # if this is not the last batch, sleep
         if i < batch_count:
             sleep(16)
+
 
 def parseArgs():
     parser = argparse.ArgumentParser(
@@ -237,6 +254,18 @@ def parseArgs():
         required=True,
         default="uatom",
         help="denom for refunds (ex. uatom)",
+    )
+    parser.add_argument(
+        "--mr",
+        "--min_refund",
+        dest="min_refund",
+        required=False,
+        default=1,
+        help=(
+            "An integer value that sets the minimum threshold for slashing compensation. "
+            "If not specified, defaults to 1. "
+            "(ex. to refund any value more than 0.001 $ATOM, you should set --min_refund 1000)"
+        ),
     )
     parser.add_argument(
         "--daemon",
@@ -265,14 +294,16 @@ def parseArgs():
         "--valcons_address",
         dest="valcons_address",
         required=True,
-        help="Valcons address of validator (ex. cosmosvalcons1c5e86exd7jsyhcfqdejltdsagjfrvv8xv22368), you can get this by doing {daemon} tendermint show-address",
+        help="Valcons address of validator (ex. cosmosvalcons1c5e86exd7jsyhcfqdejltdsagjfrvv8xv22368), "
+        "you can get this by doing {daemon} tendermint show-address",
     )
     parser.add_argument(
         "-v",
         "--valoper_address",
         dest="valoper_address",
         required=True,
-        help="Valoper address of validator (ex. cosmosvaloper140l6y2gp3gxvay6qtn70re7z2s0gn57zfd832j), you can get this by doing {daemon} keys show --bech=val -a {keyname}",
+        help="Valoper address of validator (ex. cosmosvaloper140l6y2gp3gxvay6qtn70re7z2s0gn57zfd832j), "
+        "you can get this by doing {daemon} keys show --bech=val -a {keyname}",
     )
     parser.add_argument(
         "-s",
@@ -347,6 +378,7 @@ def main():
     global BIN_DIR
     args = parseArgs()
     denom = args.denom
+    min_refund = args.min_refund
     daemon = args.daemon
     chain_id = args.chain_id
     endpoint = args.endpoint
@@ -360,12 +392,13 @@ def main():
     should_broadcast = not args.no_broadcast
     logger.debug(f"DEBUG: args: {args}")
 
-    BIN_DIR = get_daemon_path(daemon)
+    if not BIN_DIR:
+        BIN_DIR = get_daemon_path(daemon)
 
     slash_block = getSlashBlock(endpoint, valcons_address)
     logger.info(f"Slash block: {slash_block}")
     refund_amounts = calculateRefundAmounts(
-        daemon, endpoint, chain_id, slash_block, valoper_address
+        daemon, endpoint, chain_id, slash_block, valoper_address, min_refund
     )
 
     writeRefundsCsv(refund_amounts)
